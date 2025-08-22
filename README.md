@@ -1,337 +1,301 @@
-# Short video clips → Audio → Transcripts → Keywords → Clusters (Windows)
+# Short video clips → Audio → Transcripts → Keywords → LinkedIn posts (Ubuntu 24.04)
 
-End-to-end workflow to:
+End-to-end pipeline to:
 
-1. extract audio tracks from `1.mp4..58.mp4`,
-2. transcribe to SRT/VTT/TXT,
-3. build a CSV of corpus + keywords,
-4. cluster by topics.
+1. extract audio tracks from `.mp4`,
+2. transcribe/translate to `.srt/.vtt/.txt`,
+3. mine keywords (TF-IDF),
+4. generate multi-line **LinkedIn post variations** per item.
 
-All commands are **PowerShell** on Windows.
+> Scripts are batch-friendly and avoid unnecessary re-encoding/decoding work.
 
 ---
 
-## Prerequisites
+## 0) What’s inside
 
-* **PowerShell** (run as user).
-* **FFmpeg** (either on `PATH` or copied next to your files).
+* `01_extract_audio.py` — remuxes audio tracks out of MP4 **without re-encoding** (PyAV/FFmpeg bindings). Chooses `.m4a` for AAC/ALAC; otherwise `.mka`. Handles multiple audio streams, recursion, flat/mirrored folders.&#x20;
+* `02_transcribe_whisper.py` — batch transcribe/translate with **openai-whisper**; decodes via **PyAV** (no `ffmpeg` subprocess), auto-selects **CUDA** if available, writes SRT/VTT/TXT.
+* `03_extract_keywords_srt.py` — builds a single CSV `(file, text, keywords)` using **scikit-learn TF-IDF** over SRT text (timestamps/indices stripped), with domain-term filtering to keep keywords general.
+* `04_make_linkedin_posts.py` — calls the OpenAI API to generate **N** distinct, **multi-line** LinkedIn posts per input row; enforces a dedicated **“Follow @Brand — URL”** line and a single final **hashtags** line. CSV outputs are Excel-friendly (UTF-8 BOM). API key via env or flag.
+* **NEW**: `Makefile` — one-liners for install (CPU or CUDA), pipeline steps, GPU check, smoke test, clean/reset.
+* **NEW**: `scripts/smoke_test.py` — validates FFmpeg/PyAV, Torch/CUDA, Whisper model load; optionally round-trips a sample media file.
 
-  ```powershell
-  winget install Gyan.FFmpeg  # or: choco install ffmpeg -y
-  where ffmpeg; ffmpeg -version
+---
+
+## 1) Quickstart with **Make**
+
+> Requires GNU Make (present by default on Ubuntu) and `sudo` for system deps.
+
+```bash
+# 1) System packages (Ubuntu 24.04)
+make apt-deps
+
+# 2) Create venv + install Python deps
+#    Pick ONE based on your machine (CPU-only is universal):
+make install-cpu
+# or: make install-cu126
+# or: make install-cu124
+# or: make install-cu121
+
+# 3) Environment checks
+make gpu          # prints torch version, CUDA availability, device name
+make smoke        # runs environment smoke test
+
+# 4) End-to-end pipeline (override variables as needed)
+make all IN=./videos MODEL=small NUM=5 \
+  BRAND=BlockchainAdvisorsLtd \
+  BRAND_URL=https://linkedin.com/company/blockchainadvisorsltd \
+  OPENAI_KEY=sk-proj-....
+```
+or you can set OPENAI_API_KEY in the .env file and exclude it from the make all command above or include OPENAI_KEY in the above (notice the difference please!)
+
+**Common Make variables** (override like `VAR=value`):
+`IN` (input videos), `AUDIO_DIR`, `TRANS_DIR`, `CSV`, `POSTS_DIR`, `MODEL`, `FORMATS`, `TASK`, `DEVICE`, `NUM`, `BRAND`, `BRAND_URL`, `OPENAI_KEY`.
+
+> Tip: for the posts step, set `OPENAI_API_KEY` in your shell (or pass `OPENAI_KEY=` to Make).
+
+---
+
+## 2) System prerequisites (Ubuntu 24.04)
+
+Install build tools + FFmpeg dev headers (needed by **PyAV**):
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip ffmpeg \
+  build-essential pkg-config \
+  libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
+  libswresample-dev libswscale-dev
+```
+
+> `02_transcribe_whisper.py` decodes via **PyAV** (not the `ffmpeg` CLI), but having `ffmpeg` on PATH is handy for diagnostics.&#x20;
+
+---
+
+## 3) Optional: NVIDIA GPU + CUDA + PyTorch
+
+1. **Driver**:
+
+```bash
+nvidia-smi || echo "No NVIDIA driver yet"
+# To install the recommended driver (then reboot):
+# sudo ubuntu-drivers autoinstall && sudo reboot
+```
+
+2. **Choose the correct PyTorch wheel** (pick exactly one):
+
+```bash
+# CPU-only (portable)
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+# CUDA 12.6
+pip install torch --index-url https://download.pytorch.org/whl/cu126
+# CUDA 12.4
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+# CUDA 12.1
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+
+3. **Verify**:
+
+```bash
+python - << 'PY'
+import torch
+print("Torch:", torch.__version__, "CUDA?", torch.cuda.is_available())
+print("Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+PY
+```
+
+`02_transcribe_whisper.py` will default to `--device auto` and use CUDA+FP16 when available.&#x20;
+
+---
+
+## 4) Python environment
+
+Create a per-project virtualenv:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip wheel setuptools
+```
+
+Install packages:
+
+```bash
+# Core pipeline
+pip install av openai-whisper numpy scikit-learn pandas openai
+
+# Then install ONE torch wheel per Section 3 (CPU or CUDA)
+```
+
+---
+
+## 5) Configuration (OpenAI API key)
+
+For the posts generator:
+
+```bash
+export OPENAI_API_KEY="sk-..."   # preferred
+# or pass --api-key "sk-..." to 04_make_linkedin_posts.py
+```
+
+The script normalises punctuation and line breaks; each variant includes a dedicated **“Follow @Brand — URL”** line and a single final **hashtags** line.&#x20;
+
+---
+
+## 6) Usage — step by step
+
+### 6.1 Extract audio from `.mp4`
+
+```bash
+python 01_extract_audio.py -i ./videos -o ./audio -r
+```
+
+* Remux only (no re-encode); picks `.m4a` for AAC/ALAC or `.mka` otherwise.
+* Multi-track files produce `*_audio-0.m4a`, `*_audio-1.m4a`, …
+* `--flat` to avoid mirroring subfolders; `--force` to overwrite.
+
+### 6.2 Transcribe / translate (Whisper)
+
+```bash
+python 02_transcribe_whisper.py -i ./audio -o ./transcripts -r \
+  -m small -f srt,vtt,txt --task transcribe --device auto
+```
+
+* Models: `tiny|base|small|medium|large` (default `small`).
+* Device: `auto|cpu|cuda` (default `auto` → CUDA if available).
+* Writes any combination of SRT/VTT/TXT; decoding via **PyAV**.
+
+### 6.3 Build corpus+keywords CSV
+
+```bash
+python 03_extract_keywords_srt.py -i ./transcripts -r \
+  -o corpus_keywords.csv -n 12
+```
+
+* Strips indices/timestamps/markup, filters domain terms, TF-IDF (1–2-grams), outputs `file,text,keywords`.&#x20;
+
+### 6.4 Generate LinkedIn post variations
+
+```bash
+export OPENAI_API_KEY="sk-..."
+python 04_make_linkedin_posts.py -c corpus_keywords.csv -o posts -n 5 \
+  -m gpt-5-nano -b BlockchainAdvisorsLtd \
+  --brand-url https://linkedin.com/company/blockchainadvisorsltd
+```
+
+* One CSV per input row (`*_posts.csv`) with columns `variant,post`.
+* Enforces **multi-line** copy, a dedicated **follow** line, then all hashtags on a single final line.&#x20;
+
+---
+
+## 7) End-to-end examples
+
+### Folder of videos, recursive
+
+```bash
+# 1) Audio
+python 01_extract_audio.py -i ./videos -o ./audio -r
+# 2) Transcribe (auto GPU)
+python 02_transcribe_whisper.py -i ./audio -o ./transcripts -r -m small -f srt,vtt,txt
+# 3) Keywords
+python 03_extract_keywords_srt.py -i ./transcripts -r -o corpus_keywords.csv -n 12
+# 4) Posts
+python 04_make_linkedin_posts.py -c corpus_keywords.csv -o posts -n 5 \
+  -m gpt-5-nano -b BlockchainAdvisorsLtd --brand-url https://linkedin.com/company/blockchainadvisorsltd
+```
+
+### Single file, quick test
+
+```bash
+python 01_extract_audio.py -i ./videos/clip.mp4 -o ./audio
+python 02_transcribe_whisper.py -i ./audio/clip_audio.m4a -o ./transcripts -m tiny
+python 03_extract_keywords_srt.py -i ./transcripts/clip_audio.srt -o corpus_keywords.csv -n 10
+python 04_make_linkedin_posts.py -c corpus_keywords.csv -o posts -n 4 --api-key "sk-..."
+```
+
+---
+
+## 8) Performance tips
+
+* Prefer smaller Whisper models (`small`/`base`) for speed; CUDA + FP16 (auto) accelerates significantly.&#x20;
+* Keep inputs/outputs on SSD; avoid deep nesting unless needed.
+* For multi-track `.mp4`, step 1 exports **all** audio streams, then step 2 transcribes the file(s) you care about.&#x20;
+
+---
+
+## 9) Troubleshooting
+
+* **PyAV build/import** — ensure FFmpeg dev libs are installed; verify with:
+
+  ```bash
+  python -c "import av; import sys; print('PyAV OK')"
   ```
-* **Python 3.10+** and **pip**:
-
-  ```powershell
-  python --version
-  ```
-* Python packages:
-
-  ```powershell
-  pip install openai-whisper scikit-learn numpy
-  ```
-
-> If `whisper` can’t find FFmpeg, add its `bin` folder to `PATH` or run it from the same folder as `ffmpeg.exe`.
+* **CUDA not used** — confirm `nvidia-smi` and that you installed a matching **cu121/cu124** torch wheel.
+* **No audio** — confirm the file actually has an audio stream (`ffprobe -hide_banner file.mp4`) or run step 1 first.&#x20;
+* **OpenAI auth** — set `OPENAI_API_KEY` or use `--api-key`; outbound TLS must be permitted.
+* **Post format** — the generator enforces the follow line and consolidates hashtags onto a single final line.&#x20;
 
 ---
 
-## Step 1 — Extract audio tracks from MP4
+## 10) Make targets reference
 
-**Assumptions:** files are `1.mp4` … `58.mp4` in the current directory; FFmpeg/FFprobe are invoked as `.\ffmpeg` / `.\ffprobe`.
-
-```powershell
-1..58 | % {
-  $num=$_; $f="$num.mp4";
-  $cnt=(.\ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$f" | Measure-Object -Line).Lines
-  if($cnt -gt 0){
-    if($cnt -eq 1){
-      .\ffmpeg -hide_banner -loglevel error -y -i "$f" -map 0:a:0 -c copy "${num}_audio.m4a"
-    } else {
-      0..($cnt-1) | % { $k=$_; .\ffmpeg -hide_banner -loglevel error -y -i "$f" -map 0:a:$k -c copy "${num}_audio-$k.m4a" }
-    }
-  }
-}
-```
-
-**Output naming**
-
-* Single track → `N_audio.m4a`
-* Multiple tracks → `N_audio-0.m4a`, `N_audio-1.m4a`, …
+* `apt-deps` — install Ubuntu packages (FFmpeg dev headers, etc.).
+* `venv` — create `.venv` and upgrade pip/wheel/setuptools.
+* `install-cpu` / `install-cu124` / `install-cu121` — install Python deps + chosen Torch wheel.
+* `extract` / `transcribe` / `keywords` / `posts` — run each pipeline step.
+* `all` — run the full pipeline.
+* `gpu` — print Torch/CUDA info.
+* `smoke` — run `scripts/smoke_test.py`.
+* `clean` — remove outputs; `reset` — also remove the venv.
 
 ---
 
-## Step 2 — Transcribe audio (SRT/VTT/TXT)
+## 11) Repo layout
 
-```powershell
-mkdir transcripts -Force
-$m="small"     # tiny|base|small|medium|large
-Get-ChildItem *.m4a | % {
-  python -m whisper $_.FullName --model $m -f all --output_dir transcripts --verbose False
-}
 ```
-
-**Notes**
-
-* Force language if needed: `--language en` (or `ro`, etc.).
-* GPU (if CUDA): add `--device cuda`.
-* Per-file example:
-
-  ```powershell
-  python -m whisper .\10_audio.m4a --model small -f all --output_dir transcripts --verbose False
-  ```
-
----
-
-## Step 3 — Extract keywords to a single CSV
-
-Place the two scripts below in your working folder.
-
-`extract_keywords_srt.py`
-
-```python
-# Usage: python extract_keywords_srt.py -i . -n 12
-# Output: corpus_keywords.csv (columns: file,text,keywords)
-
-import os, re, glob, csv, argparse
-import numpy as np
-from typing import List
-from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
-
-SRT_TIME = re.compile(r"^\d{2}:\d{2}:\d{2}[,.]\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}[,.]\d{3}$")
-DIGIT_LINE = re.compile(r"^\d+$")
-BLOCKCHAIN_TERMS = [r"blockchain", r"web3", r"crypto", r"cryptocurrency", r"cryptocurrencies",
-    r"defi", r"nft", r"nfts", r"token", r"tokens", r"ethereum", r"solana", r"bitcoin",
-    r"btc", r"eth", r"erc20", r"erc\-20", r"erc721", r"erc\-721", r"smart contract", r"smart contracts",
-    r"dapp", r"dapps", r"layer ?\d", r"gas fee(s)?"]
-BLOCKCHAIN_RE = re.compile(r"|".join([rf"\b{t}\b" for t in BLOCKCHAIN_TERMS]), re.IGNORECASE)
-
-def srt_to_text(path: str) -> str:
-    lines=[]
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for raw in f:
-            line=raw.strip()
-            if not line or DIGIT_LINE.match(line) or SRT_TIME.match(line): continue
-            line=re.sub(r"<[^>]+>", " ", line)
-            lines.append(line)
-    text=" ".join(lines)
-    text=BLOCKCHAIN_RE.sub(" ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-def build_vectorizer():
-    extra={"ve","ll","re","ah","yeah","okay","ok","mm","uh","um","like","got","get","go","going",
-           "thing","things","really","actually","basically","kind","sort","use","used","using"}
-    stops=sorted(set(ENGLISH_STOP_WORDS)|extra)
-    def preproc(x:str)->str:
-        x=x.lower()
-        x=BLOCKCHAIN_RE.sub(" ", x)
-        return x
-    return TfidfVectorizer(preprocessor=preproc, lowercase=True, stop_words=stops,
-                           ngram_range=(1,2), max_df=0.85, max_features=20000, norm="l2")
-
-def top_terms(row_vec, feature_names: np.ndarray, topn:int) -> List[str]:
-    arr=row_vec.toarray().ravel()
-    idx=np.argsort(arr)[::-1]
-    out,seen=[],set()
-    for i in idx:
-        if arr[i] <= 0: break
-        t=feature_names[i]
-        if len(t)<3: continue
-        if BLOCKCHAIN_RE.search(t): continue
-        if t in seen: continue
-        seen.add(t); out.append(t)
-        if len(out)>=topn: break
-    return out
-
-def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument("-i","--input", default=".", help="Folder with .srt files")
-    ap.add_argument("-n","--keywords", type=int, default=10, help="Keywords per file")
-    args=ap.parse_args()
-
-    srts=sorted(glob.glob(os.path.join(args.input, "*.srt")))
-    if not srts: print("No .srt files found."); return
-
-    texts=[srt_to_text(p) or "general topic" for p in srts]
-    vect=build_vectorizer(); X=vect.fit_transform(texts); feats=np.array(vect.get_feature_names_out())
-
-    rows=[]
-    for i,p in enumerate(srts):
-        kws=top_terms(X[i], feats, args.keywords)
-        rows.append({"file": os.path.basename(p), "text": texts[i], "keywords": ", ".join(kws)})
-
-    with open("corpus_keywords.csv","w",newline="",encoding="utf-8") as f:
-        w=csv.DictWriter(f, fieldnames=["file","text","keywords"])
-        w.writeheader(); w.writerows(rows)
-    print(f"Wrote corpus_keywords.csv ({len(rows)} rows).")
-
-if __name__=="__main__": main()
-```
-
-Run:
-
-```powershell
-python extract_keywords_srt.py -i . -n 12
+.
+├─ 01_extract_audio.py
+├─ 02_transcribe_whisper.py
+├─ 03_extract_keywords_srt.py
+├─ 04_make_linkedin_posts.py
+├─ Makefile
+└─ scripts/
+   └─ smoke_test.py
 ```
 
 ---
 
-## Step 4 — Cluster by keywords
+## 12) Reproducibility
 
-`cluster_srt.py`
+After a successful install (CPU or CUDA variant), lock versions:
 
-```python
-# Usage: python cluster_srt.py -c corpus_keywords.csv -k auto -l 3
-# Outputs: tags.csv, clusters.txt
-
-import re, csv, argparse
-from collections import defaultdict
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS, CountVectorizer
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-
-BLOCKCHAIN_TERMS=[r"blockchain",r"web3",r"crypto",r"cryptocurrency",r"cryptocurrencies",
-    r"defi",r"nft",r"nfts",r"token",r"tokens",r"ethereum",r"solana",r"bitcoin",
-    r"btc",r"eth",r"erc20",r"erc\-20",r"erc721",r"erc\-721",r"smart contract",r"smart contracts",
-    r"dapp",r"dapps",r"layer ?\d",r"gas fee(s)?"]
-BLOCKCHAIN_RE=re.compile(r"|".join([rf"\b{t}\b" for t in BLOCKCHAIN_TERMS]), re.IGNORECASE)
-
-def build_text_vectorizer():
-    extra={"ve","ll","re","ah","yeah","okay","ok","mm","uh","um","like","got","get","go","going",
-           "thing","things","really","actually","basically","kind","sort","use","used","using"}
-    stops=sorted(set(ENGLISH_STOP_WORDS)|extra)
-    def preproc(x:str)->str:
-        x=x.lower()
-        x=BLOCKCHAIN_RE.sub(" ", x)
-        return x
-    return TfidfVectorizer(preprocessor=preproc, lowercase=True, stop_words=stops,
-                           ngram_range=(1,2), max_df=0.85, max_features=20000, norm="l2")
-
-def choose_k_auto(X,n):
-    if n<=2: return n
-    if n==3: return 2
-    best_k,best=-1,-1
-    for k in range(2, min(12,n-1)+1):
-        km=KMeans(n_clusters=k, n_init=10, random_state=42)
-        labels=km.fit_predict(X)
-        if len(set(labels))<2: continue
-        sc=silhouette_score(X, labels, metric="cosine")
-        if sc>best: best, best_k = sc, k
-    return best_k if best_k!=-1 else 1
-
-def label_clusters(km, feats, top=3):
-    out=[]
-    for ci in range(km.n_clusters):
-        center=km.cluster_centers_[ci]
-        idx=np.argsort(center)[::-1]
-        terms=[]
-        for i in idx:
-            t=feats[i]
-            if len(t)<3 or BLOCKCHAIN_RE.search(t): continue
-            if t not in terms: terms.append(t)
-            if len(terms)>=top: break
-        out.append(", ".join(terms) if terms else f"cluster-{ci}")
-    return out
-
-def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument("-c","--csv", default="corpus_keywords.csv")
-    ap.add_argument("-k","--clusters", default="auto")
-    ap.add_argument("-l","--label_terms", type=int, default=3)
-    ap.add_argument("--out_csv", default="tags.csv")
-    ap.add_argument("--out_txt", default="clusters.txt")
-    args=ap.parse_args()
-
-    rows=[]; used_kw=False
-    with open(args.csv,"r",encoding="utf-8") as f:
-        r=csv.DictReader(f)
-        for row in r:
-            fn=(row.get("file") or "").strip()
-            text=(row.get("text") or "").strip()
-            kw=(row.get("keywords") or "").strip()
-            doc=kw if kw else text
-            doc=BLOCKCHAIN_RE.sub(" ", doc)
-            if fn and doc: rows.append((fn, doc))
-            if kw: used_kw=True
-    if not rows: print("No rows found."); return
-
-    names=[r[0] for r in rows]; docs=[r[1] if r[1].strip() else "general topic" for r in rows]
-    vect=CountVectorizer(lowercase=True) if used_kw else build_text_vectorizer()
-    X=vect.fit_transform(docs); feats=np.array(vect.get_feature_names_out()); n=len(names)
-
-    k=choose_k_auto(X,n) if str(args.clusters).lower()=="auto" else max(1, min(int(args.clusters), n)); 
-    if n==2 and k==1: k=2
-
-    if k==1:
-        labels=np.zeros(n, dtype=int); cluster_names=["general"]
-    else:
-        km=KMeans(n_clusters=k, n_init=10, random_state=42).fit(X)
-        labels=km.labels_; cluster_names=label_clusters(km, feats, args.label_terms)
-
-    out=[["file","cluster_id","cluster_label"]]; groups=defaultdict(list)
-    for i,fn in enumerate(names):
-        cid=int(labels[i]); lab=cluster_names[cid] if cid<len(cluster_names) else f"cluster-{cid}"
-        out.append([fn, cid, lab]); groups[lab].append(fn)
-
-    with open(args.out_csv,"w",newline="",encoding="utf-8") as f: csv.writer(f).writerows(out)
-    with open(args.out_txt,"w",encoding="utf-8") as f:
-        for lab,files in groups.items():
-            f.write(f"[{lab}] ({len(files)} files)\n")
-            for fn in files: f.write(f"  - {fn}\n"); f.write("\n")
-    print(f"Done. {n} files, k={k}. Wrote {args.out_csv} and {args.out_txt}.")
-
-if __name__=="__main__": main()
-```
-
-Run:
-
-```powershell
-python cluster_srt.py -c corpus_keywords.csv -k auto -l 3
-```
-
-**Outputs**
-
-* `tags.csv` → `file, cluster_id, cluster_label`
-* `clusters.txt` → readable groups with file lists
-
----
-
-## Optional — Silence `joblib/loky` core warning
-
-```powershell
-$cores=(Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum
-$env:LOKY_MAX_CPU_COUNT = $cores
-[Environment]::SetEnvironmentVariable("LOKY_MAX_CPU_COUNT","$cores","User")
+```bash
+pip freeze > requirements.txt
 ```
 
 ---
 
-## Troubleshooting
+## 13) License & usage
 
-* **`FileNotFoundError` from whisper** → FFmpeg not on `PATH`. Add FFmpeg’s `bin` to `PATH` or run from that folder.
-* **Execution policy blocks scripts** → run one-liners or:
-
-  ```powershell
-  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-  ```
-* **Small batches (1–3 files)** → `cluster_srt.py` auto-selects a valid `k` (no silhouette errors).
-* **Non-English** → add `--language <code>` to whisper.
-* **Performance** → try `--model medium`/`large` or `--device cuda` with a supported GPU.
+* Ensure you own or are licensed to process the input media.
+* API usage for post generation is billable (OpenAI). Keep `-n` modest and prefer lighter models.&#x20;
 
 ---
 
-## Quickstart (copy–paste)
+### Appendix: Quick CUDA wheel chooser
 
-```powershell
-# 1) Extract audio
-1..58 | % { $n=$_; $f="$n.mp4"; $c=(.\ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$f" | Measure-Object -Line).Lines; if($c -gt 0){ if($c -eq 1){ .\ffmpeg -hide_banner -loglevel error -y -i "$f" -map 0:a:0 -c copy "${n}_audio.m4a" } else { 0..($c-1) | % { $k=$_; .\ffmpeg -hide_banner -loglevel error -y -i "$f" -map 0:a:$k -c copy "${n}_audio-$k.m4a" } } } }
+| Situation | Command                                                                |
+| --------- | ---------------------------------------------------------------------- |
+| CPU-only  | `pip install torch --index-url https://download.pytorch.org/whl/cpu`   |
+| CUDA 12.6 | `pip install torch --index-url https://download.pytorch.org/whl/cu126` |
+| CUDA 12.4 | `pip install torch --index-url https://download.pytorch.org/whl/cu124` |
+| CUDA 12.1 | `pip install torch --index-url https://download.pytorch.org/whl/cu121` |
 
-# 2) Transcribe (SRT/VTT/TXT)
-mkdir transcripts -Force; $m="small"; Get-ChildItem *.m4a | % { python -m whisper $_.FullName --model $m -f all --output_dir transcripts --verbose False }
+Verify:
 
-# 3) Keywords CSV
-python extract_keywords_srt.py -i . -n 12
-
-# 4) Clusters
-python cluster_srt.py -c corpus_keywords.csv -k auto -l 3
+```bash
+python - << 'PY'
+import torch; print(torch.__version__, torch.cuda.is_available())
+PY
 ```

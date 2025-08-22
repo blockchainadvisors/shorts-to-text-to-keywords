@@ -1,0 +1,12 @@
+# python virtual environment
+.venv
+
+# user files and folders
+videos/
+audio/
+transcripts/
+posts/
+corpus_keywords.csv
+
+# env vars
+.env
