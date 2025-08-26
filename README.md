@@ -137,6 +137,7 @@ For the posts generator:
 ```bash
 export OPENAI_API_KEY="sk-..."   # preferred
 # or pass --api-key "sk-..." to 04_make_linkedin_posts.py
+# or define it in .env file as OPENAI_API_KEY=sk-...
 ```
 
 The script normalises punctuation and line breaks; each variant includes a dedicated **“Follow @Brand — URL”** line and a single final **hashtags** line.&#x20;
